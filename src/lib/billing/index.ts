@@ -30,3 +30,9 @@ export {
   processStripeWebhook,
   type WebhookResult,
 } from "./webhooks.js";
+
+export {
+  scheduleDelayedRecovery,
+  listPendingRecoveries,
+  type ScheduledRecovery,
+} from "./scheduler.js";
