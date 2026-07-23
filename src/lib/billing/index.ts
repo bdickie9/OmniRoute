@@ -54,3 +54,9 @@ export {
 } from "./customers.js";
 
 export { createSeatCheckoutSession } from "./checkout.js";
+
+export {
+  reportCompletionUsage,
+  reportUsageFromOpenAIShape,
+  type CompletionUsageReport,
+} from "./reportUsage.js";
