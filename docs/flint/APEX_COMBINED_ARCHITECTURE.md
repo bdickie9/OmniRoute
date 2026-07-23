@@ -53,8 +53,9 @@
 | Architecture document            | Done            | this file                         |
 | Live-only Stripe client          | Done (v1)       | `src/lib/billing/stripe-client.ts`|
 | Usage metering skeleton          | Done (v1)       | `src/lib/billing/metering.ts`     |
-| Webhook handler skeleton         | Planned         | `src/server/billing/webhooks.ts`  |
-| Revenue recovery engine          | Planned         | `src/lib/billing/recovery.ts`     |
+| Webhook handler                  | Done (v1)       | `src/lib/billing/webhooks.ts`     |
+| **Revenue recovery engine**      | **Done (v1)**   | `src/lib/billing/recovery.ts`     |
+| Recovery documentation           | Done            | `docs/flint/REVENUE_RECOVERY.md`  |
 | Dashboard billing UI             | Planned         | dashboard routes                  |
 | Langfuse integration             | Planned         | observability layer               |
 | Multi-tenant mode                | Planned         | auth + tenancy                    |
@@ -67,6 +68,10 @@ STRIPE_SECRET_KEY=sk_live_...
 STRIPE_WEBHOOK_SECRET=whsec_...
 STRIPE_METER_EVENT_NAME=omniroute_tokens   # or similar
 FLINT_BILLING_MODE=live                    # "test" is rejected
+
+# Recovery tuning (optional)
+FLINT_RECOVERY_MAX_ATTEMPTS=5
+FLINT_RECOVERY_PENALTY_BUDGET_CENTS=5000
 ```
 
 Any `sk_test_` key will cause the process to refuse to start when billing is enabled.
@@ -75,9 +80,9 @@ Any `sk_test_` key will cause the process to refuse to start when billing is ena
 
 1. Wire metering into the existing request lifecycle (after successful upstream response).
 2. Create Stripe Products / Prices / Meters in the live Flint Tech account.
-3. Implement webhook handler for `invoice.paid`, `invoice.payment_failed`, `customer.subscription.*`.
-4. Add recovery logic for failed payments.
-5. Expose usage + spend in the existing analytics dashboard.
+3. Add a Next.js API route that calls `processStripeWebhook`.
+4. Connect a job queue / cron for delayed recovery attempts (`delaySeconds > 300`).
+5. Expose usage + spend + recovery metrics in the existing analytics dashboard.
 6. Add multi-tenant isolation.
 
 This document is the single source of truth for the combined system.
