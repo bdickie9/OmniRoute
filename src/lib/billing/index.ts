@@ -34,5 +34,7 @@ export {
 export {
   scheduleDelayedRecovery,
   listPendingRecoveries,
+  isDurableQueueActive,
   type ScheduledRecovery,
+  type RecoveryJobPayload,
 } from "./scheduler.js";

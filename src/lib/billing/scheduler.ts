@@ -1,18 +1,27 @@
 /**
- * Flint Tech — Delayed Recovery Scheduler (v1)
+ * Flint Tech — Durable Recovery Scheduler
  *
- * Simple in-process scheduler for recovery attempts that need a delay > 5 minutes.
- * For production at scale, replace with a durable job queue (BullMQ, Inngest, etc.).
+ * Best design for real revenue recovery:
  *
- * v1 behaviour:
- * - Stores pending retries in memory
- * - Uses setTimeout for delays up to a few hours
- * - On process restart, pending retries are lost (acceptable for early live testing;
- *   durable storage is the next hardening step)
+ * 1. PRIMARY (production): BullMQ + Redis
+ *    - Jobs survive process restarts, deploys, and crashes
+ *    - Safe across multiple instances
+ *    - Built-in delayed jobs + job-level retries
+ *
+ * 2. FALLBACK (local / no Redis): in-memory timers
+ *    - Same API surface so callers do not change
+ *    - Acceptable for single-node desktop / quick testing only
+ *
+ * Recovery steps remain idempotent: workers always re-fetch the
+n * invoice / PaymentIntent and skip if already paid/succeeded.
  */
 
 import { attemptRecovery, type RecoveryContext } from "./recovery.js";
 import { getStripeClient, isLiveBillingEnabled } from "./stripe-client.js";
+
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
 
 export interface ScheduledRecovery {
   paymentId: string;
@@ -21,15 +30,145 @@ export interface ScheduledRecovery {
   reason: string;
   scheduledAt: string;
   runAt: string;
+  backend: "bullmq" | "memory";
 }
 
-const pending = new Map<string, NodeJS.Timeout>();
+export interface RecoveryJobPayload {
+  paymentId: string;
+  attemptNumber: number;
+  reason: string;
+}
 
-/**
- * Schedule a delayed recovery attempt.
- * Returns immediately; the actual attempt runs after delaySeconds.
- */
-export async function scheduleDelayedRecovery(opts: {
+const QUEUE_NAME = "flint-revenue-recovery";
+const JOB_NAME = "recovery.retry";
+
+// ---------------------------------------------------------------------------
+// Memory fallback (v1 behaviour)
+// ---------------------------------------------------------------------------
+
+const memoryPending = new Map<string, NodeJS.Timeout>();
+
+function scheduleInMemory(opts: {
+  paymentId: string;
+  delaySeconds: number;
+  attemptNumber: number;
+  reason: string;
+}): ScheduledRecovery {
+  const scheduledAt = new Date();
+  const runAt = new Date(scheduledAt.getTime() + opts.delaySeconds * 1000);
+
+  const existing = memoryPending.get(opts.paymentId);
+  if (existing) clearTimeout(existing);
+
+  const timer = setTimeout(async () => {
+    memoryPending.delete(opts.paymentId);
+    await executeRecoveryJob({
+      paymentId: opts.paymentId,
+      attemptNumber: opts.attemptNumber,
+      reason: opts.reason,
+    });
+  }, opts.delaySeconds * 1000);
+
+  if (typeof timer.unref === "function") timer.unref();
+  memoryPending.set(opts.paymentId, timer);
+
+  console.info("[Flint Recovery] Scheduled (memory fallback)", {
+    paymentId: opts.paymentId,
+    delaySeconds: opts.delaySeconds,
+    runAt: runAt.toISOString(),
+  });
+
+  return {
+    paymentId: opts.paymentId,
+    delaySeconds: opts.delaySeconds,
+    attemptNumber: opts.attemptNumber,
+    reason: opts.reason,
+    scheduledAt: scheduledAt.toISOString(),
+    runAt: runAt.toISOString(),
+    backend: "memory",
+  };
+}
+
+// ---------------------------------------------------------------------------
+// BullMQ (durable) — lazy init so the package is optional until installed
+// ---------------------------------------------------------------------------
+
+let bullQueue: any = null;
+let bullWorker: any = null;
+let bullInitAttempted = false;
+let bullAvailable: boolean | null = null;
+
+async function ensureBullMQ(): Promise<boolean> {
+  if (bullInitAttempted) return bullAvailable === true;
+  bullInitAttempted = true;
+
+  const redisUrl =
+    process.env.FLINT_RECOVERY_REDIS_URL ??
+    process.env.REDIS_URL ??
+    process.env.OMNIROUTE_REDIS_URL;
+
+  if (!redisUrl) {
+    bullAvailable = false;
+    console.info(
+      "[Flint Recovery] No Redis URL — using memory fallback. Set FLINT_RECOVERY_REDIS_URL for durable jobs."
+    );
+    return false;
+  }
+
+  try {
+    // Dynamic import so the app still boots if bullmq is not yet installed
+    const bullmq = await import("bullmq");
+    const { Queue, Worker } = bullmq;
+
+    const connection = { url: redisUrl };
+
+    bullQueue = new Queue(QUEUE_NAME, {
+      connection,
+      defaultJobOptions: {
+        removeOnComplete: 1000,
+        removeOnFail: 5000,
+        attempts: 3,
+        backoff: { type: "exponential", delay: 60_000 },
+      },
+    });
+
+    // Worker runs in-process. For large scale, run a dedicated worker process.
+    bullWorker = new Worker(
+      QUEUE_NAME,
+      async (job: { data: RecoveryJobPayload }) => {
+        await executeRecoveryJob(job.data);
+      },
+      { connection, concurrency: 2 }
+    );
+
+    bullWorker.on("failed", (job: any, err: Error) => {
+      console.error("[Flint Recovery] BullMQ job failed", {
+        paymentId: job?.data?.paymentId,
+        error: err?.message,
+      });
+    });
+
+    bullWorker.on("completed", (job: any) => {
+      console.info("[Flint Recovery] BullMQ job completed", {
+        paymentId: job?.data?.paymentId,
+      });
+    });
+
+    bullAvailable = true;
+    console.info("[Flint Recovery] BullMQ durable queue ready", { queue: QUEUE_NAME });
+    return true;
+  } catch (err) {
+    bullAvailable = false;
+    console.warn(
+      "[Flint Recovery] BullMQ unavailable — falling back to memory.",
+      err instanceof Error ? err.message : String(err),
+      "Install with: npm install bullmq"
+    );
+    return false;
+  }
+}
+
+async function scheduleWithBullMQ(opts: {
   paymentId: string;
   delaySeconds: number;
   attemptNumber: number;
@@ -38,49 +177,50 @@ export async function scheduleDelayedRecovery(opts: {
   const scheduledAt = new Date();
   const runAt = new Date(scheduledAt.getTime() + opts.delaySeconds * 1000);
 
-  const entry: ScheduledRecovery = {
+  // Dedupe: one active delayed job per paymentId
+  const jobId = `recovery:${opts.paymentId}`;
+
+  await bullQueue.add(
+    JOB_NAME,
+    {
+      paymentId: opts.paymentId,
+      attemptNumber: opts.attemptNumber,
+      reason: opts.reason,
+    } satisfies RecoveryJobPayload,
+    {
+      jobId,
+      delay: opts.delaySeconds * 1000,
+      // If a job with same id exists, replace delay (BullMQ 4+ removeOnComplete etc. already set)
+    }
+  );
+
+  console.info("[Flint Recovery] Scheduled (BullMQ durable)", {
+    paymentId: opts.paymentId,
+    delaySeconds: opts.delaySeconds,
+    runAt: runAt.toISOString(),
+    jobId,
+  });
+
+  return {
     paymentId: opts.paymentId,
     delaySeconds: opts.delaySeconds,
     attemptNumber: opts.attemptNumber,
     reason: opts.reason,
     scheduledAt: scheduledAt.toISOString(),
     runAt: runAt.toISOString(),
+    backend: "bullmq",
   };
-
-  // Cancel any existing timer for the same payment
-  const existing = pending.get(opts.paymentId);
-  if (existing) {
-    clearTimeout(existing);
-  }
-
-  const timer = setTimeout(async () => {
-    pending.delete(opts.paymentId);
-    await executeScheduledRecovery(opts.paymentId, opts.attemptNumber);
-  }, opts.delaySeconds * 1000);
-
-  // Prevent the timer from keeping the process alive forever in some runtimes
-  if (typeof timer.unref === "function") {
-    timer.unref();
-  }
-
-  pending.set(opts.paymentId, timer);
-
-  console.info("[Flint Recovery Scheduler] Scheduled", {
-    paymentId: opts.paymentId,
-    delaySeconds: opts.delaySeconds,
-    runAt: entry.runAt,
-    reason: opts.reason,
-  });
-
-  return entry;
 }
 
-async function executeScheduledRecovery(
-  paymentId: string,
-  attemptNumber: number
-): Promise<void> {
+// ---------------------------------------------------------------------------
+// Shared execution (idempotent)
+// ---------------------------------------------------------------------------
+
+async function executeRecoveryJob(payload: RecoveryJobPayload): Promise<void> {
+  const { paymentId, attemptNumber } = payload;
+
   if (!isLiveBillingEnabled()) {
-    console.warn("[Flint Recovery Scheduler] Live billing disabled — skipping", paymentId);
+    console.warn("[Flint Recovery] Live billing disabled — skipping", paymentId);
     return;
   }
 
@@ -88,11 +228,10 @@ async function executeScheduledRecovery(
   if (!stripe) return;
 
   try {
-    // Re-fetch the latest invoice / payment state so we don't retry a payment that already succeeded
     if (paymentId.startsWith("in_")) {
       const invoice = await stripe.invoices.retrieve(paymentId);
       if (invoice.status === "paid") {
-        console.info("[Flint Recovery Scheduler] Invoice already paid — skipping", paymentId);
+        console.info("[Flint Recovery] Invoice already paid — skip", paymentId);
         return;
       }
 
@@ -106,23 +245,22 @@ async function executeScheduledRecovery(
         currency: invoice.currency ?? "usd",
         attemptCount: attemptNumber,
         failedAt: new Date().toISOString(),
-        declineCode: undefined,
       };
 
       const result = await attemptRecovery(ctx);
-      console.info("[Flint Recovery Scheduler] Attempt finished", {
+      console.info("[Flint Recovery] Attempt finished", {
         paymentId,
         success: result.success,
         reason: result.decision.reason,
+        backend: bullAvailable ? "bullmq" : "memory",
       });
       return;
     }
 
-    // PaymentIntent path
     if (paymentId.startsWith("pi_")) {
       const pi = await stripe.paymentIntents.retrieve(paymentId);
       if (pi.status === "succeeded") {
-        console.info("[Flint Recovery Scheduler] PaymentIntent already succeeded — skipping", paymentId);
+        console.info("[Flint Recovery] PaymentIntent already succeeded — skip", paymentId);
         return;
       }
 
@@ -139,21 +277,60 @@ async function executeScheduledRecovery(
       };
 
       const result = await attemptRecovery(ctx);
-      console.info("[Flint Recovery Scheduler] Attempt finished", {
+      console.info("[Flint Recovery] Attempt finished", {
         paymentId,
         success: result.success,
         reason: result.decision.reason,
+        backend: bullAvailable ? "bullmq" : "memory",
       });
     }
   } catch (err) {
-    console.error("[Flint Recovery Scheduler] Execution error", {
+    console.error("[Flint Recovery] Execution error", {
       paymentId,
       error: err instanceof Error ? err.message : String(err),
     });
+    // Re-throw so BullMQ can apply job-level retries
+    throw err;
   }
 }
 
-/** Inspect currently pending scheduled recoveries (for diagnostics). */
+// ---------------------------------------------------------------------------
+// Public API (unchanged for callers)
+// ---------------------------------------------------------------------------
+
+/**
+ * Schedule a delayed recovery attempt.
+ * Uses BullMQ when Redis is configured; otherwise memory fallback.
+ */
+export async function scheduleDelayedRecovery(opts: {
+  paymentId: string;
+  delaySeconds: number;
+  attemptNumber: number;
+  reason: string;
+}): Promise<ScheduledRecovery> {
+  const useBull = await ensureBullMQ();
+
+  if (useBull && bullQueue) {
+    try {
+      return await scheduleWithBullMQ(opts);
+    } catch (err) {
+      console.warn(
+        "[Flint Recovery] BullMQ enqueue failed — falling back to memory",
+        err instanceof Error ? err.message : String(err)
+      );
+      return scheduleInMemory(opts);
+    }
+  }
+
+  return scheduleInMemory(opts);
+}
+
+/** Diagnostic: memory-pending payment IDs (BullMQ state lives in Redis). */
 export function listPendingRecoveries(): string[] {
-  return Array.from(pending.keys());
+  return Array.from(memoryPending.keys());
+}
+
+/** Whether the durable backend is active in this process. */
+export async function isDurableQueueActive(): Promise<boolean> {
+  return ensureBullMQ();
 }
