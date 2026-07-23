@@ -38,3 +38,19 @@ export {
   type ScheduledRecovery,
   type RecoveryJobPayload,
 } from "./scheduler.js";
+
+export {
+  FLINT_CATALOG,
+  getPlan,
+  getSeatPriceId,
+  getUsagePriceId,
+  type FlintPlanId,
+  type FlintPlan,
+} from "./catalog.js";
+
+export {
+  ensureStripeCustomer,
+  type EnsureCustomerInput,
+} from "./customers.js";
+
+export { createSeatCheckoutSession } from "./checkout.js";
