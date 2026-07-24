@@ -60,3 +60,5 @@ export {
   reportUsageFromOpenAIShape,
   type CompletionUsageReport,
 } from "./reportUsage.js";
+
+export { registerFlintUsageBridge } from "./usageBridge.js";
