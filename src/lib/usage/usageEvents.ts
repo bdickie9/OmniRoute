@@ -8,18 +8,44 @@
  * across modules that have nothing to do with usage recording. usageHistory
  * emits here; providerLimits subscribes at module load.
  *
+ * Flint billing also subscribes to the detailed event for live Stripe metering.
+ *
  * @module lib/usage/usageEvents
  */
 
 export type UsageRecordedListener = (provider: string, connectionId: string) => void;
 
+/** Rich payload for billing / analytics subscribers (Flint metering). */
+export type UsageRecordedDetail = {
+  provider: string | null | undefined;
+  connectionId: string | null | undefined;
+  model?: string | null;
+  apiKeyId?: string | null;
+  apiKeyName?: string | null;
+  tokensInput?: number;
+  tokensOutput?: number;
+  success?: boolean;
+  endpoint?: string | null;
+};
+
+export type UsageRecordedDetailListener = (detail: UsageRecordedDetail) => void;
+
 const listeners = new Set<UsageRecordedListener>();
+const detailListeners = new Set<UsageRecordedDetailListener>();
 
 /** Register a listener for usage-recorded events. Returns an unsubscribe fn. */
 export function onUsageRecorded(listener: UsageRecordedListener): () => void {
   listeners.add(listener);
   return () => {
     listeners.delete(listener);
+  };
+}
+
+/** Register a detailed usage listener (tokens + api key). Returns unsubscribe. */
+export function onUsageRecordedDetail(listener: UsageRecordedDetailListener): () => void {
+  detailListeners.add(listener);
+  return () => {
+    detailListeners.delete(listener);
   };
 }
 
@@ -35,6 +61,18 @@ export function emitUsageRecorded(
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       console.warn(`[usageEvents] usage-recorded listener failed: ${message}`);
+    }
+  }
+}
+
+/** Emit detailed usage (for billing). Always fires when called — callers gate on insert. */
+export function emitUsageRecordedDetail(detail: UsageRecordedDetail): void {
+  for (const listener of detailListeners) {
+    try {
+      listener(detail);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.warn(`[usageEvents] usage-recorded detail listener failed: ${message}`);
     }
   }
 }
