@@ -103,6 +103,15 @@ async function startServer() {
     startupLog.info("Guardrail registry initialized");
     startupLog.info("Builtin skill handlers registered");
 
+    // Flint: live Stripe metering bridge (no-op unless FLINT_BILLING_MODE=live)
+    try {
+      const { registerFlintUsageBridge } = await import("./lib/billing/usageBridge");
+      registerFlintUsageBridge();
+      startupLog.info("Flint usage→Stripe metering bridge registered");
+    } catch (err) {
+      startupLog.warn({ err }, "Flint usage bridge failed to register (non-fatal)");
+    }
+
     // Load active plugins on startup so they survive restarts
     try {
       const { pluginManager } = await import("./lib/plugins/manager");
