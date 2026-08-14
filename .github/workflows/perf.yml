@@ -1,0 +1,20 @@
+name: perf-ci
+on:
+  pull_request:
+    branches:
+      - 'perf/**'
+
+jobs:
+  perf:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run perf bootstrap and linters
+        run: |
+          chmod +x ./ci/perf.sh || true
+          ./ci/perf.sh
+      - name: Upload perf report
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-report
+          path: perf-report.txt
