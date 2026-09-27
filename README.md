@@ -1,3 +1,5 @@
+> **Fork notice:** this repository is a fork of https://github.com/diegosouzapw/OmniRoute by diegosouzapw, licensed under MIT. The original code remains the property of its authors. See [FORK_NOTICE.md](FORK_NOTICE.md).
+
 <div align="center">
 
 <img src="./docs/screenshots/MainOmniRoute.png" alt="OmniRoute Dashboard" width="820"/>
